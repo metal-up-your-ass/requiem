@@ -1,6 +1,9 @@
 #include "ReverbEngine.h"
 
-ReverbEngine::ReverbEngine() = default;
+ReverbEngine::ReverbEngine()
+{
+    userIrFormatManager.registerBasicFormats();
+}
 
 void ReverbEngine::prepare (const juce::dsp::ProcessSpec& spec)
 {
@@ -26,20 +29,35 @@ void ReverbEngine::prepare (const juce::dsp::ProcessSpec& spec)
     }
     else
     {
-        // Force (re)generation even if Decay/Damping happen to match the
-        // last-generated values: prepare() can run after a sample-rate
-        // change, which invalidates any previously generated buffer (it was
-        // sized and sampled for the old rate).
-        lastGeneratedDecaySeconds = -1.0f;
-        lastGeneratedDampingHz = -1.0f;
-
+        // Always (re)generate here, even if the requested parameters happen
+        // to match the last-generated ones: prepare() can run after a
+        // sample-rate change, which invalidates any previously generated
+        // buffer (it was sized and sampled for the old rate).
         loadProceduralImpulseResponse (requestedDecaySeconds.load (std::memory_order_relaxed),
-                                        requestedDampingHz.load (std::memory_order_relaxed));
+                                        requestedDampingHz.load (std::memory_order_relaxed),
+                                        static_cast<ReverbIR::SpaceType> (requestedSpace.load (std::memory_order_relaxed)),
+                                        requestedEarlyLateBalance01.load (std::memory_order_relaxed),
+                                        requestedFreeze.load (std::memory_order_relaxed));
     }
 
     convolution.prepare (spec);
 
     preDelayLine.prepare (spec);
+
+    // See docs/architecture.md ("DryWetMixer gotcha"): juce::dsp::Chorus
+    // owns its own internal DryWetMixer, primed the same way - its
+    // prepare() calls update() (which sets the mixer's *target* wet
+    // proportion from whatever setMix() last configured) before its own
+    // reset(). Configuring the chorus's parameters here, before calling
+    // prepare(), ensures the very first process() call after (re)prepare
+    // already reflects lastModulationAmount01 instead of the class's own
+    // built-in defaults (rate 1 Hz / depth 0.25 / mix 0.5).
+    modulationChorus.setRate (modulationRateHz);
+    modulationChorus.setCentreDelay (modulationCentreDelayMs);
+    modulationChorus.setFeedback (0.0f);
+    modulationChorus.setDepth (mapModulationDepth (lastModulationAmount01));
+    modulationChorus.setMix (mapModulationMix (lastModulationAmount01));
+    modulationChorus.prepare (spec);
 
     outputGain.setRampDurationSeconds (smoothingTimeSeconds);
     outputGain.prepare (spec);
@@ -49,7 +67,8 @@ void ReverbEngine::prepare (const juce::dsp::ProcessSpec& spec)
     // juce::dsp::Convolution's default configuration (used here) is
     // zero-latency and uniformly partitioned, so this is normally 0 -
     // queried rather than assumed so the plugin stays correct if a fixed-
-    // latency configuration is ever adopted instead.
+    // latency configuration is ever adopted instead. Modulation (chorus)
+    // adds no reported latency (see getLatencySamples()'s doc comment).
     latencySamples = convolution.getLatency();
     dryWetMixer.setWetLatency (static_cast<float> (latencySamples));
 
@@ -81,6 +100,7 @@ void ReverbEngine::reset()
 {
     preDelayLine.reset();
     convolution.reset();
+    modulationChorus.reset();
     outputGain.reset();
     dryWetMixer.reset();
 }
@@ -111,6 +131,27 @@ void ReverbEngine::setOutputDb (float newOutputDb)
     outputGain.setGainDecibels (newOutputDb);
 }
 
+float ReverbEngine::mapModulationDepth (float amount01) noexcept
+{
+    return juce::jmap (juce::jlimit (0.0f, 1.0f, amount01), 0.0f, 1.0f, 0.05f, 0.35f);
+}
+
+float ReverbEngine::mapModulationMix (float amount01) noexcept
+{
+    return juce::jlimit (0.0f, 1.0f, amount01) * 0.5f;
+}
+
+void ReverbEngine::setModulationAmount (float newAmount01)
+{
+    lastModulationAmount01 = juce::jlimit (0.0f, 1.0f, newAmount01);
+    // juce::dsp::Chorus smooths depth (via its own internal SmoothedValue)
+    // and mix (via its own internal DryWetMixer's ~50 ms ramp) itself, so -
+    // like Mix above - re-applying the target every block is cheap and
+    // keeps automation zipper-free without an extra SmoothedValue here.
+    modulationChorus.setDepth (mapModulationDepth (lastModulationAmount01));
+    modulationChorus.setMix (mapModulationMix (lastModulationAmount01));
+}
+
 void ReverbEngine::setDecaySeconds (float newDecaySeconds)
 {
     requestedDecaySeconds.store (newDecaySeconds, std::memory_order_relaxed);
@@ -121,29 +162,69 @@ void ReverbEngine::setDampingHz (float newDampingHz)
     requestedDampingHz.store (newDampingHz, std::memory_order_relaxed);
 }
 
+void ReverbEngine::setSpaceType (ReverbIR::SpaceType newSpace)
+{
+    requestedSpace.store (static_cast<int> (newSpace), std::memory_order_relaxed);
+}
+
+void ReverbEngine::setEarlyLateBalance (float newBalance01)
+{
+    requestedEarlyLateBalance01.store (newBalance01, std::memory_order_relaxed);
+}
+
+void ReverbEngine::setFreeze (bool shouldFreeze)
+{
+    requestedFreeze.store (shouldFreeze, std::memory_order_relaxed);
+}
+
 void ReverbEngine::regenerateImpulseResponseIfNeeded()
 {
     if (usingUserImpulseResponse)
-        return; // A user IR override is active; Decay/Damping don't drive the procedural generator while it is.
+        return; // A user IR override is active; these parameters don't drive the procedural generator while it is.
 
     const auto decay = requestedDecaySeconds.load (std::memory_order_relaxed);
     const auto damping = requestedDampingHz.load (std::memory_order_relaxed);
+    const auto space = static_cast<ReverbIR::SpaceType> (requestedSpace.load (std::memory_order_relaxed));
+    const auto earlyLateBalance = requestedEarlyLateBalance01.load (std::memory_order_relaxed);
+    const auto freeze = requestedFreeze.load (std::memory_order_relaxed);
 
     // Small epsilon avoids reloading on floating-point noise from repeated
     // identical parameter pushes (e.g. a host re-sending the same
     // automation value on every block).
     constexpr float epsilon = 1.0e-3f;
 
-    if (std::abs (decay - lastGeneratedDecaySeconds) < epsilon
-        && std::abs (damping - lastGeneratedDampingHz) < epsilon)
+    const auto decayChanged = std::abs (decay - lastGeneratedDecaySeconds) >= epsilon;
+    const auto dampingChanged = std::abs (damping - lastGeneratedDampingHz) >= epsilon;
+    const auto spaceChanged = space != lastGeneratedSpace;
+    const auto balanceChanged = std::abs (earlyLateBalance - lastGeneratedEarlyLateBalance01) >= epsilon;
+    const auto freezeChanged = freeze != lastGeneratedFreeze;
+
+    if (! decayChanged && ! dampingChanged && ! spaceChanged && ! balanceChanged && ! freezeChanged)
         return;
 
-    loadProceduralImpulseResponse (decay, damping);
+    loadProceduralImpulseResponse (decay, damping, space, earlyLateBalance, freeze);
 }
 
 bool ReverbEngine::loadUserImpulseResponse (const juce::File& file)
 {
     if (! file.existsAsFile())
+        return false;
+
+    // Sanity-check the file is actually readable audio (and not
+    // pathologically long) *before* handing it to juce::dsp::Convolution,
+    // so a bogus/mis-selected file leaves usingUserImpulseResponse/
+    // userImpulseResponseFile - and therefore the currently active IR -
+    // completely unchanged rather than silently switching to a file
+    // Convolution itself couldn't actually load.
+    std::unique_ptr<juce::AudioFormatReader> reader (userIrFormatManager.createReaderFor (file));
+
+    if (reader == nullptr || reader->numChannels == 0 || reader->lengthInSamples <= 0 || reader->sampleRate <= 0.0)
+        return false;
+
+    const auto durationSeconds = static_cast<double> (reader->lengthInSamples) / reader->sampleRate;
+    reader.reset(); // release the reader before Convolution opens the file itself
+
+    if (durationSeconds > maxUserImpulseResponseSeconds)
         return false;
 
     const auto stereo = numChannels >= 2 ? juce::dsp::Convolution::Stereo::yes
@@ -169,12 +250,17 @@ void ReverbEngine::clearUserImpulseResponse()
     // next regenerateImpulseResponseIfNeeded() tick) so the revert is
     // effective as soon as this call returns.
     loadProceduralImpulseResponse (requestedDecaySeconds.load (std::memory_order_relaxed),
-                                    requestedDampingHz.load (std::memory_order_relaxed));
+                                    requestedDampingHz.load (std::memory_order_relaxed),
+                                    static_cast<ReverbIR::SpaceType> (requestedSpace.load (std::memory_order_relaxed)),
+                                    requestedEarlyLateBalance01.load (std::memory_order_relaxed),
+                                    requestedFreeze.load (std::memory_order_relaxed));
 }
 
-void ReverbEngine::loadProceduralImpulseResponse (float decaySeconds, float dampingHz)
+void ReverbEngine::loadProceduralImpulseResponse (float decaySeconds, float dampingHz,
+                                                    ReverbIR::SpaceType space, float earlyLateBalance01, bool freeze)
 {
-    auto impulseResponse = ReverbIR::generateProceduralImpulseResponse (sampleRate, decaySeconds, dampingHz, numChannels);
+    auto impulseResponse = ReverbIR::generateProceduralImpulseResponse (sampleRate, decaySeconds, dampingHz, numChannels,
+                                                                          space, earlyLateBalance01, freeze);
 
     const auto stereo = numChannels >= 2 ? juce::dsp::Convolution::Stereo::yes
                                           : juce::dsp::Convolution::Stereo::no;
@@ -185,6 +271,9 @@ void ReverbEngine::loadProceduralImpulseResponse (float decaySeconds, float damp
 
     lastGeneratedDecaySeconds = decaySeconds;
     lastGeneratedDampingHz = dampingHz;
+    lastGeneratedSpace = space;
+    lastGeneratedEarlyLateBalance01 = earlyLateBalance01;
+    lastGeneratedFreeze = freeze;
 }
 
 void ReverbEngine::process (juce::dsp::AudioBlock<float>& block) noexcept
@@ -195,12 +284,12 @@ void ReverbEngine::process (juce::dsp::AudioBlock<float>& block) noexcept
         return;
 
     // Capture the pre-processing signal as "dry" before Pre-Delay/
-    // convolution/Width touch `block`. DryWetMixer internally delays this
-    // by getLatencySamples() (set via setWetLatency in prepare()) so it
-    // stays time-aligned with the (normally zero-latency) wet path below.
-    // Pre-Delay is deliberately *not* part of this compensation - it is an
-    // audible effect parameter (the gap before the tail), not something to
-    // hide from the dry signal.
+    // convolution/Modulation/Width touch `block`. DryWetMixer internally
+    // delays this by getLatencySamples() (set via setWetLatency in
+    // prepare()) so it stays time-aligned with the (normally zero-latency)
+    // wet path below. Pre-Delay is deliberately *not* part of this
+    // compensation - it is an audible effect parameter (the gap before the
+    // tail), not something to hide from the dry signal.
     dryWetMixer.pushDrySamples (block);
 
     const auto preDelaySamples = juce::jlimit (0.0f,
@@ -212,6 +301,7 @@ void ReverbEngine::process (juce::dsp::AudioBlock<float>& block) noexcept
 
     preDelayLine.process (context);
     convolution.process (context);
+    modulationChorus.process (context);
 
     applyWidth (block);
 

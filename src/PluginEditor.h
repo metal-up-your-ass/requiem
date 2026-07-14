@@ -20,8 +20,10 @@ public:
 
 private:
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
+    using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+    using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
 
-    // One knob + label per parameter, in signal-flow order.
+    // One knob + label per float/choice parameter, in signal-flow order.
     struct Knob
     {
         juce::Slider slider;
@@ -40,6 +42,20 @@ private:
     Knob widthKnob;
     Knob mixKnob;
     Knob outputKnob;
+
+    // Space/Early-Late-Balance/Modulation/Freeze: a second row, added for
+    // the M1 DSP-completion parameters. Space is a choice parameter (a
+    // ComboBox suits it far better than a rotary slider); Freeze is a
+    // boolean toggle.
+    juce::Label spaceLabel;
+    juce::ComboBox spaceCombo;
+    std::unique_ptr<ComboBoxAttachment> spaceAttachment;
+
+    Knob earlyLateBalanceKnob;
+    Knob modulationKnob;
+
+    juce::ToggleButton freezeButton { "Freeze" };
+    std::unique_ptr<ButtonAttachment> freezeAttachment;
 
     juce::TextButton loadIrButton { "Load IR..." };
     juce::TextButton clearIrButton { "Clear IR" };

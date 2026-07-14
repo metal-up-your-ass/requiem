@@ -3,6 +3,8 @@
 #include "params/ParameterIds.h"
 #include "params/ParameterLayout.h"
 
+#include <cmath>
+
 namespace
 {
     // Rate at which the message-thread timer polls Decay/Damping for
@@ -26,6 +28,10 @@ RequiemAudioProcessor::RequiemAudioProcessor()
     widthPercent = apvts.getRawParameterValue (ParamIDs::width);
     mixPercent = apvts.getRawParameterValue (ParamIDs::mix);
     outputDb = apvts.getRawParameterValue (ParamIDs::output);
+    spaceChoice = apvts.getRawParameterValue (ParamIDs::space);
+    earlyLateBalancePercent = apvts.getRawParameterValue (ParamIDs::earlyLateBalance);
+    modulationPercent = apvts.getRawParameterValue (ParamIDs::modulation);
+    freezeToggle = apvts.getRawParameterValue (ParamIDs::freeze);
 
     jassert (decaySeconds != nullptr);
     jassert (preDelayMs != nullptr);
@@ -33,6 +39,10 @@ RequiemAudioProcessor::RequiemAudioProcessor()
     jassert (widthPercent != nullptr);
     jassert (mixPercent != nullptr);
     jassert (outputDb != nullptr);
+    jassert (spaceChoice != nullptr);
+    jassert (earlyLateBalancePercent != nullptr);
+    jassert (modulationPercent != nullptr);
+    jassert (freezeToggle != nullptr);
 }
 
 RequiemAudioProcessor::~RequiemAudioProcessor()
@@ -118,6 +128,15 @@ void RequiemAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     engine.setWidthPercent (widthPercent->load (std::memory_order_relaxed));
     engine.setMixProportion (mixPercent->load (std::memory_order_relaxed) * 0.01f);
     engine.setOutputDb (outputDb->load (std::memory_order_relaxed));
+    // AudioParameterChoice exposes its raw APVTS value as the choice index
+    // (0/1/2 here), which maps 1:1 onto ReverbIR::SpaceType's declaration
+    // order (see ParameterLayout.cpp).
+    engine.setSpaceType (static_cast<ReverbIR::SpaceType> (juce::jlimit (0, 2,
+        static_cast<int> (std::lround (spaceChoice->load (std::memory_order_relaxed))))));
+    engine.setEarlyLateBalance (earlyLateBalancePercent->load (std::memory_order_relaxed) * 0.01f);
+    engine.setModulationAmount (modulationPercent->load (std::memory_order_relaxed) * 0.01f);
+    // AudioParameterBool exposes its raw APVTS value as 0.0f/1.0f.
+    engine.setFreeze (freezeToggle->load (std::memory_order_relaxed) >= 0.5f);
 
     engine.prepare (spec);
 
@@ -177,6 +196,15 @@ void RequiemAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     engine.setWidthPercent (widthPercent->load (std::memory_order_relaxed));
     engine.setMixProportion (mixPercent->load (std::memory_order_relaxed) * 0.01f);
     engine.setOutputDb (outputDb->load (std::memory_order_relaxed));
+    // AudioParameterChoice exposes its raw APVTS value as the choice index
+    // (0/1/2 here), which maps 1:1 onto ReverbIR::SpaceType's declaration
+    // order (see ParameterLayout.cpp).
+    engine.setSpaceType (static_cast<ReverbIR::SpaceType> (juce::jlimit (0, 2,
+        static_cast<int> (std::lround (spaceChoice->load (std::memory_order_relaxed))))));
+    engine.setEarlyLateBalance (earlyLateBalancePercent->load (std::memory_order_relaxed) * 0.01f);
+    engine.setModulationAmount (modulationPercent->load (std::memory_order_relaxed) * 0.01f);
+    // AudioParameterBool exposes its raw APVTS value as 0.0f/1.0f.
+    engine.setFreeze (freezeToggle->load (std::memory_order_relaxed) >= 0.5f);
 
     juce::dsp::AudioBlock<float> block (buffer);
     engine.process (block);

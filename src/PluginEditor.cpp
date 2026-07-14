@@ -10,8 +10,16 @@ namespace
     constexpr int margin = 20;
     constexpr int numKnobs = 6;
     constexpr int editorWidth = margin * 2 + numKnobs * knobSize + (numKnobs - 1) * margin;
+
+    // Second row: Space combo + Early/Late Balance knob + Modulation knob +
+    // Freeze toggle.
+    constexpr int secondRowHeight = knobSize;
+    constexpr int spaceComboWidth = 140;
+    constexpr int freezeButtonWidth = 90;
+
     constexpr int irRowHeight = 30;
-    constexpr int editorHeight = margin * 3 + labelHeight + knobSize + textBoxHeight + irRowHeight;
+    constexpr int editorHeight = margin * 4 + labelHeight + knobSize + textBoxHeight
+                                  + secondRowHeight + irRowHeight;
 }
 
 RequiemAudioProcessorEditor::RequiemAudioProcessorEditor (RequiemAudioProcessor& processorToEdit)
@@ -24,6 +32,28 @@ RequiemAudioProcessorEditor::RequiemAudioProcessorEditor (RequiemAudioProcessor&
     configureKnob (widthKnob, ParamIDs::width, "Width");
     configureKnob (mixKnob, ParamIDs::mix, "Mix");
     configureKnob (outputKnob, ParamIDs::output, "Output");
+
+    spaceLabel.setText ("Space", juce::dontSendNotification);
+    spaceLabel.setJustificationType (juce::Justification::centred);
+    spaceLabel.attachToComponent (&spaceCombo, false);
+    addAndMakeVisible (spaceLabel);
+
+    // Populate the combo directly from the parameter's own choices, so the
+    // GUI can never drift out of sync with ParameterLayout.cpp's ordering.
+    if (auto* spaceParam = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (ParamIDs::space)))
+    {
+        int itemId = 1;
+        for (const auto& choice : spaceParam->choices)
+            spaceCombo.addItem (choice, itemId++);
+    }
+    addAndMakeVisible (spaceCombo);
+    spaceAttachment = std::make_unique<ComboBoxAttachment> (audioProcessor.apvts, ParamIDs::space, spaceCombo);
+
+    configureKnob (earlyLateBalanceKnob, ParamIDs::earlyLateBalance, "Early/Late");
+    configureKnob (modulationKnob, ParamIDs::modulation, "Modulation");
+
+    addAndMakeVisible (freezeButton);
+    freezeAttachment = std::make_unique<ButtonAttachment> (audioProcessor.apvts, ParamIDs::freeze, freezeButton);
 
     loadIrButton.onClick = [this]
     {
@@ -85,7 +115,7 @@ void RequiemAudioProcessorEditor::updateIrStatusLabel()
     if (audioProcessor.isUsingUserImpulseResponse())
         irStatusLabel.setText ("IR: " + audioProcessor.getUserImpulseResponseFile().getFileName(), juce::dontSendNotification);
     else
-        irStatusLabel.setText ("IR: procedural (Decay/Damping)", juce::dontSendNotification);
+        irStatusLabel.setText ("IR: procedural (Decay/Damping/Space)", juce::dontSendNotification);
 }
 
 void RequiemAudioProcessorEditor::resized()
@@ -100,7 +130,24 @@ void RequiemAudioProcessorEditor::resized()
     irStatusLabel.setBounds (irRow);
 
     bounds.removeFromBottom (margin);
-    bounds.removeFromTop (labelHeight); // room for the attached labels above each knob
+
+    // Second row: Space combo + Early/Late Balance + Modulation + Freeze.
+    auto secondRow = bounds.removeFromBottom (secondRowHeight);
+    secondRow.removeFromTop (labelHeight); // room for the Space label above the combo
+
+    auto spaceArea = secondRow.removeFromLeft (spaceComboWidth);
+    spaceCombo.setBounds (spaceArea.withSizeKeepingCentre (spaceComboWidth, textBoxHeight));
+    secondRow.removeFromLeft (margin);
+
+    earlyLateBalanceKnob.slider.setBounds (secondRow.removeFromLeft (knobSize));
+    secondRow.removeFromLeft (margin);
+    modulationKnob.slider.setBounds (secondRow.removeFromLeft (knobSize));
+    secondRow.removeFromLeft (margin);
+    freezeButton.setBounds (secondRow.removeFromLeft (freezeButtonWidth).withSizeKeepingCentre (freezeButtonWidth, textBoxHeight));
+
+    bounds.removeFromBottom (margin);
+
+    bounds.removeFromTop (labelHeight); // room for the attached labels above each first-row knob
 
     const auto slotWidth = bounds.getWidth() / numKnobs;
 
