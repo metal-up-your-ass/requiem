@@ -89,6 +89,48 @@ namespace rqm
             0.0f,
             juce::AudioParameterFloatAttributes().withLabel ("dB")));
 
+        //======================================================================
+        // Space: shapes the early-reflection layer of the procedurally
+        // generated impulse response. Default index 1 = Hall (the balanced
+        // v0.1-era character). Order must match ReverbIR::SpaceType.
+        layout.add (std::make_unique<juce::AudioParameterChoice> (
+            juce::ParameterID { ParamIDs::space, 1 },
+            "Space",
+            juce::StringArray { "Cathedral", "Hall", "Chamber" },
+            1));
+
+        //======================================================================
+        // Early/Late Balance: 0% = early-reflection layer dominant (short,
+        // direct, distinct slap), 100% = diffuse late tail dominant (smooth
+        // wash, no distinct early reflections). Default 80% keeps the tail
+        // close to the v0.1-era all-diffuse character while still giving
+        // the early layer some presence.
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            juce::ParameterID { ParamIDs::earlyLateBalance, 1 },
+            "Early/Late Balance",
+            juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f),
+            80.0f,
+            juce::AudioParameterFloatAttributes().withLabel ("%")));
+
+        //======================================================================
+        // Modulation: depth of a subtle post-convolution chorus-style
+        // modulation applied to the wet tail only. Default 0% is a bit-
+        // identical passthrough of the unmodulated tail.
+        layout.add (std::make_unique<juce::AudioParameterFloat> (
+            juce::ParameterID { ParamIDs::modulation, 1 },
+            "Modulation",
+            juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f),
+            0.0f,
+            juce::AudioParameterFloatAttributes().withLabel ("%")));
+
+        //======================================================================
+        // Freeze: sustains the current tail's spectral content instead of
+        // letting it decay. Off by default.
+        layout.add (std::make_unique<juce::AudioParameterBool> (
+            juce::ParameterID { ParamIDs::freeze, 1 },
+            "Freeze",
+            false));
+
         return layout;
     }
 }

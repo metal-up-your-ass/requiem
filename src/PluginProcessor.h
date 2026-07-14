@@ -81,6 +81,10 @@ private:
     std::atomic<float>* widthPercent = nullptr;
     std::atomic<float>* mixPercent = nullptr;
     std::atomic<float>* outputDb = nullptr;
+    std::atomic<float>* spaceChoice = nullptr;
+    std::atomic<float>* earlyLateBalancePercent = nullptr;
+    std::atomic<float>* modulationPercent = nullptr;
+    std::atomic<float>* freezeToggle = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RequiemAudioProcessor)
 };

@@ -4,7 +4,8 @@
 // Requiem. See docs/architecture.md for the corresponding signal-flow
 // diagram.
 //
-// FROZEN AS OF THE v0.1 PARAMETER LAYOUT:
+// FROZEN AS OF THE v0.1.0 PARAMETER LAYOUT (the complete list below,
+// including the M1 additions - space/earlyLateBalance/modulation/freeze):
 // Parameter IDs below must NEVER change once shipped - saved sessions and
 // presets persist the APVTS state keyed by these string IDs, and renaming or
 // removing one would silently break every user's saved state. Ranges,
@@ -36,6 +37,26 @@ namespace ParamIDs
 
     // Output trim, applied after the dry/wet mix.
     inline constexpr auto output = "output";
+
+    // Space character: shapes the discrete early-reflection layer of the
+    // procedurally generated impulse response (Cathedral/Hall/Chamber - see
+    // ReverbIR::SpaceType). Does not affect the diffuse late tail, which is
+    // still governed purely by Decay/Damping.
+    inline constexpr auto space = "space";
+
+    // Equal-power crossfade between the early-reflection layer (0%) and the
+    // diffuse late tail (100%) baked into the generated impulse response.
+    inline constexpr auto earlyLateBalance = "earlyLateBalance";
+
+    // Depth of a subtle post-convolution chorus-style modulation applied to
+    // the wet tail only (juce::dsp::Chorus), to soften metallic ringing/add
+    // richness. 0% is a bit-identical passthrough of the unmodulated tail.
+    inline constexpr auto modulation = "modulation";
+
+    // Sustains the tail's current spectral content instead of letting it
+    // decay, by regenerating the impulse response with a flat envelope
+    // (see ReverbIR::generateProceduralImpulseResponse's freeze parameter).
+    inline constexpr auto freeze = "freeze";
 }
 
 // Not an APVTS parameter (it's a string, not automatable) - the path of an
