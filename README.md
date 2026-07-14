@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/icon.png" alt="Requiem icon" width="160"/></p>
+
 # Requiem
 
 *A cathedral in a box — cinematic convolution reverb for orchestral and choral space.*
