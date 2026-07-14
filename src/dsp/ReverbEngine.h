@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_dsp/juce_dsp.h>
 
 #include "ImpulseResponseGenerator.h"
@@ -8,20 +9,22 @@
 // The complete Requiem signal path, independent of juce::AudioProcessor so
 // it can be exercised directly by unit tests without instantiating a full
 // plugin (see tests/EngineTests.cpp). Owns all DSP state; every buffer/
-// filter/delay-line/convolution engine is allocated in prepare() and never
-// reallocated on the audio thread.
+// filter/delay-line/convolution/chorus engine is allocated in prepare() and
+// never reallocated on the audio thread.
 //
 // Signal flow (see docs/architecture.md for the full diagram and the
 // latency-compensation rationale):
 //
-//   input -> Pre-Delay -> Convolution (wet) -> Width (M/S, wet only)
-//         -> Dry/Wet Mix (latency-compensated) -> Output trim
+//   input -> Pre-Delay -> Convolution (wet) -> Modulation (chorus, wet only)
+//         -> Width (M/S, wet only) -> Dry/Wet Mix (latency-compensated)
+//         -> Output trim
 //
 // The impulse response driving the Convolution stage is generated
 // procedurally off the audio thread (see ImpulseResponseGenerator.h) from
-// the Decay/Damping parameters, or - if a user IR has been loaded - read
-// from an audio file. Decay/Damping changes only ever update an atomic
-// "requested value"; the actual (re)generation and
+// the Decay/Damping/Space/Early-Late-Balance/Freeze parameters, or - if a
+// user IR has been loaded - read from an audio file. Decay/Damping/Space/
+// Early-Late-Balance/Freeze changes only ever update an atomic "requested
+// value"; the actual (re)generation and
 // juce::dsp::Convolution::loadImpulseResponse call happens only inside
 // regenerateImpulseResponseIfNeeded()/loadUserImpulseResponse(), which the
 // owning PluginProcessor calls from a message-thread juce::Timer - never
@@ -35,7 +38,7 @@ public:
     ReverbEngine();
 
     // Allocates all DSP state and (re)generates the initial impulse
-    // response (procedural, from the last commanded Decay/Damping, or the
+    // response (procedural, from the last commanded parameters, or the
     // active user IR file if one was loaded before this call). Must be
     // called (and completed) before the first process() call, and again
     // whenever sample rate/block size/channel count change. Not real-time
@@ -43,8 +46,9 @@ public:
     // message thread (e.g. AudioProcessor::prepareToPlay).
     void prepare (const juce::dsp::ProcessSpec& spec);
 
-    // Clears all filter/delay-line/convolution state without deallocating.
-    // Safe to call from the audio thread (e.g. on playback stop/loop).
+    // Clears all filter/delay-line/convolution/chorus state without
+    // deallocating. Safe to call from the audio thread (e.g. on playback
+    // stop/loop).
     void reset();
 
     // Processes `block` in place. `block` must have at most the maximum
@@ -53,14 +57,22 @@ public:
     void process (juce::dsp::AudioBlock<float>& block) noexcept;
 
     //==============================================================================
-    // Real-time-safe parameter setters: smoothed, no allocation/locks. Safe
-    // to call every block from the audio thread.
+    // Real-time-safe parameter setters: smoothed (or internally ramped by
+    // the owned juce::dsp objects), no allocation/locks. Safe to call every
+    // block from the audio thread.
     void setPreDelayMs (float newPreDelayMs);
     void setWidthPercent (float newWidthPercent);
     void setMixProportion (float newProportion01);
     void setOutputDb (float newOutputDb);
 
-    // Real-time-safe to *call* - this only stores the requested value in an
+    // Depth of the post-convolution Modulation (chorus) stage applied to
+    // the wet tail only, in [0, 1]. 0 leaves the chorus's internal dry/wet
+    // mix at 0 (bit-identical passthrough of its input); real-time safe -
+    // forwards directly to juce::dsp::Chorus's own internally smoothed
+    // parameters every block, the same pattern used for Mix/DryWetMixer.
+    void setModulationAmount (float newAmount01);
+
+    // Real-time-safe to *call* - these only store the requested value in an
     // atomic. No allocation, no impulse-response regeneration happens here;
     // that only occurs inside regenerateImpulseResponseIfNeeded() (message
     // thread only, see below). Safe to call every block from the audio
@@ -68,19 +80,26 @@ public:
     // value without needing to know which thread it's on).
     void setDecaySeconds (float newDecaySeconds);
     void setDampingHz (float newDampingHz);
+    void setSpaceType (ReverbIR::SpaceType newSpace);
+    void setEarlyLateBalance (float newBalance01);
+    void setFreeze (bool shouldFreeze);
 
     // Message-thread only. Regenerates and loads a new procedural impulse
-    // response if Decay and/or Damping have changed since the last
-    // generated IR, and no user IR override is currently active. A cheap
-    // no-op otherwise, so it is safe to call frequently (e.g. from a
-    // ~20 Hz juce::Timer in PluginProcessor).
+    // response if any of Decay/Damping/Space/Early-Late-Balance/Freeze have
+    // changed since the last generated IR, and no user IR override is
+    // currently active. A cheap no-op otherwise, so it is safe to call
+    // frequently (e.g. from a ~20 Hz juce::Timer in PluginProcessor).
     void regenerateImpulseResponseIfNeeded();
 
     // Message-thread only. Loads a user-supplied impulse-response audio
     // file (WAV/AIFF/etc, anything juce::AudioFormatManager's basic formats
     // support), overriding the procedural generator until
     // clearUserImpulseResponse() is called. Returns false, without changing
-    // any state, if the file doesn't exist or isn't readable as audio.
+    // any state, if the file doesn't exist, isn't readable as valid audio
+    // (a format-reader sanity check runs before anything is handed to
+    // juce::dsp::Convolution), or exceeds maxUserImpulseResponseSeconds -
+    // guarding against a pathologically long "IR" file driving convolution
+    // CPU/memory far outside what a real captured space would ever need.
     bool loadUserImpulseResponse (const juce::File& file);
 
     // Message-thread only. Reverts to the procedural generator, discarding
@@ -91,16 +110,30 @@ public:
     bool isUsingUserImpulseResponse() const noexcept { return usingUserImpulseResponse; }
     juce::File getUserImpulseResponseFile() const { return userImpulseResponseFile; }
 
+    // User-supplied impulse-response files longer than this are rejected by
+    // loadUserImpulseResponse() rather than loaded - generous enough for
+    // any real captured space (cathedral IRs are rarely more than a few
+    // seconds), while bounding the convolution engine's worst-case CPU/
+    // memory cost against a mis-selected non-IR audio file.
+    static constexpr double maxUserImpulseResponseSeconds = 30.0;
+
     // Latency reported by the convolution engine (samples), valid after
     // prepare() has run. juce::dsp::Convolution's default configuration
     // (used here) is zero-latency/uniformly partitioned, so this is
     // normally 0, but it is queried rather than assumed so the plugin stays
-    // correct if that ever changes.
+    // correct if that ever changes. The Modulation (chorus) stage adds no
+    // reported latency - it is a short, continuously modulated delay, not a
+    // bulk delay, and is treated the same way a hardware chorus/vibrato
+    // effect would be (see docs/architecture.md).
     int getLatencySamples() const noexcept { return latencySamples; }
 
 private:
-    void loadProceduralImpulseResponse (float decaySeconds, float dampingHz);
+    void loadProceduralImpulseResponse (float decaySeconds, float dampingHz,
+                                         ReverbIR::SpaceType space, float earlyLateBalance01, bool freeze);
     void applyWidth (juce::dsp::AudioBlock<float>& block) noexcept;
+
+    static float mapModulationDepth (float amount01) noexcept;
+    static float mapModulationMix (float amount01) noexcept;
 
     static constexpr double smoothingTimeSeconds = 0.05;
     // 250 ms at up to 192 kHz, plus a small margin - sized once so
@@ -108,11 +141,19 @@ private:
     // is not real-time safe) regardless of host sample rate.
     static constexpr int maxPreDelaySamples = static_cast<int> (0.25 * 192000.0) + 4;
 
+    // Fixed Modulation (chorus) character - only its depth/mix are exposed
+    // as the user-facing Modulation parameter; rate/centre-delay/feedback
+    // are chosen for a subtle, non-seasick "richness" effect rather than an
+    // obvious chorus/flanger and are not automatable.
+    static constexpr float modulationRateHz = 0.35f;
+    static constexpr float modulationCentreDelayMs = 12.0f;
+
     double sampleRate = 44100.0;
     int numChannels = 2;
 
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> preDelayLine { maxPreDelaySamples };
     juce::dsp::Convolution convolution;
+    juce::dsp::Chorus<float> modulationChorus;
     juce::dsp::Gain<float> outputGain;
 
     // Sized generously above any realistic convolution latency (the default
@@ -130,23 +171,38 @@ private:
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> widthAmountSmoothed;
 
     // Last commanded values (ParameterLayout defaults until a setter is
-    // called), re-applied to the smoothers on every prepare() so re-prepare
-    // (sample-rate change, etc.) never resets a live parameter back to a
-    // default.
+    // called), re-applied to the smoothers/DSP objects on every prepare()
+    // so re-prepare (sample-rate change, etc.) never resets a live
+    // parameter back to a default.
     float lastPreDelayMs = 20.0f;
     float lastWidthPercent = 100.0f;
     float lastMixProportion = 0.35f;
+    float lastModulationAmount01 = 0.0f;
 
-    // Decay/Damping: the "requested" value is just an atomic, safe to write
-    // from any thread; the "last generated" value is message-thread-only
-    // state used to detect changes in regenerateImpulseResponseIfNeeded().
+    // Decay/Damping/Space/Early-Late-Balance/Freeze: the "requested" value
+    // is just an atomic, safe to write from any thread; the "last
+    // generated" value is message-thread-only state used to detect changes
+    // in regenerateImpulseResponseIfNeeded().
     std::atomic<float> requestedDecaySeconds { 2.5f };
     std::atomic<float> requestedDampingHz { 8000.0f };
+    std::atomic<int> requestedSpace { static_cast<int> (ReverbIR::SpaceType::hall) };
+    std::atomic<float> requestedEarlyLateBalance01 { 0.8f };
+    std::atomic<bool> requestedFreeze { false };
+
     float lastGeneratedDecaySeconds = -1.0f; // forces generation on first prepare()
     float lastGeneratedDampingHz = -1.0f;
+    ReverbIR::SpaceType lastGeneratedSpace = ReverbIR::SpaceType::hall;
+    float lastGeneratedEarlyLateBalance01 = 0.8f;
+    bool lastGeneratedFreeze = false;
 
     bool usingUserImpulseResponse = false;
     juce::File userImpulseResponseFile;
+
+    // Used only by loadUserImpulseResponse() to sanity-check a candidate
+    // file (readable audio, sane length) before handing it to
+    // juce::dsp::Convolution - message-thread only, never touched from
+    // process().
+    juce::AudioFormatManager userIrFormatManager;
 
     int latencySamples = 0;
 
